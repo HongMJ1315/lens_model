@@ -69,7 +69,7 @@ bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
     lens.scale = 0.002f;       // 若你的場景很大，可以調高這裡 (例如 0.1 表示 1mm = 0.1 單位)
     lens.is_valid = 1; // 設為 1 代表啟用
 
-    float focus_offset = 8.0f;
+    float focus_offset = 11.8f; 
     float current_z = raw_el[N - 1].thick + focus_offset;
 
     // 將資料由後向前 (Rear to Front) 反轉，建立給光追用的結構
@@ -83,10 +83,22 @@ bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
         if (out.radius != 0.0f) out.z_center = out.z_surf - out.radius;
         else out.z_center = 0.0f;
 
-        // 設定折射率 (光線從底片往場景射)
         out.eta_in = raw_el[csv_idx].nd;
-        if (csv_idx == 0) out.eta_out = 1.0f; // 最前方鏡片接觸空氣
-        else out.eta_out = raw_el[csv_idx - 1].nd;
+        out.vno_in = raw_el[csv_idx].vno;
+
+        if (csv_idx == 0) {
+            out.eta_out = 1.0f; 
+            out.vno_out = 0.0f; // 空氣無色散
+        }
+        else {
+            out.eta_out = raw_el[csv_idx - 1].nd;
+            out.vno_out = raw_el[csv_idx - 1].vno;
+        }
+
+        // // 設定折射率 (光線從底片往場景射)
+        // out.eta_in = raw_el[csv_idx].nd;
+        // if (csv_idx == 0) out.eta_out = 1.0f; // 最前方鏡片接觸空氣
+        // else out.eta_out = raw_el[csv_idx - 1].nd;
 
         lens.elements[i] = out;
         

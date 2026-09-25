@@ -47,6 +47,21 @@ __global__ void cuda_path_trace_kernel(
         float pixel_x = (float) px + curand_uniform(&localState);
         float pixel_y = (float) py + curand_uniform(&localState);
 
+        float u_color = curand_uniform(&localState);
+        float lambda_nm;
+        float3 throughput; // 刪除下方的 float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
+        
+        if(u_color < 0.333333f){
+            lambda_nm = 650.0f; // 紅光
+            throughput = make_float3(3.0f, 0.0f, 0.0f); // 權重 * 3，強迫只捕捉紅色
+        }else if(u_color < 0.666666f){
+            lambda_nm = 532.0f; // 綠光
+            throughput = make_float3(0.0f, 3.0f, 0.0f);
+        }else{
+            lambda_nm = 450.0f; // 藍光
+            throughput = make_float3(0.0f, 0.0f, 3.0f);
+        }
+
         float3 eyeray_point, eyeray_dir;
 
         // --- [修改區] 物理鏡頭光線生成 ---
@@ -59,7 +74,7 @@ __global__ void cuda_path_trace_kernel(
 
             if(!generate_lens_ray(*d_lens, pixel_x, pixel_y, W, H,
                 cam.eye, cam_forward, cam_u, cam_v,
-                eyeray_point, eyeray_dir, curand_uniform(&localState), curand_uniform(&localState))){
+                eyeray_point, eyeray_dir, curand_uniform(&localState), curand_uniform(&localState), lambda_nm)){
                 // 光線被鏡片邊緣擋住 (Vignetting 暗角效應)，無法進入場景
                 // printf("Ray blocked by lens at pixel (%f, %f)\n", pixel_x, pixel_y);
                 continue;
@@ -77,7 +92,6 @@ __global__ void cuda_path_trace_kernel(
         //     eyeray_dir.x, eyeray_dir.y, eyeray_dir.z);
 
         float eyeray_refract = 1.0f;
-        float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
         bool last_is_delta = true;
         float last_pdf_bsdf = 1.0f;

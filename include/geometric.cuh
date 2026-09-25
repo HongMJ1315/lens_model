@@ -85,6 +85,8 @@ struct CudaLensElement{
     float aperture_radius;  // 通光半徑 (孔徑/2)
     float eta_in;           // 光線進入此面時的折射率
     float eta_out;          // 光線離開此面時的折射率
+    float vno_in;          // 光線進入此面時的法向量方向 (1.0 = 朝 +Z, -1.0 = 朝 -Z)
+    float vno_out;         // 光線離開此面時的法向量方向 (1.0 = 朝 +Z, -1.0 = 朝 -Z)
     float z_surf;           // 鏡片表面在 Z 軸的頂點位置
 };
 
@@ -640,9 +642,21 @@ HOST_DEVICE inline void bsdf_sample(
     bsdf_val = bsdf_evaluate(mtl, wo_w, wi_w, N);
 }
 
+HOST_DEVICE inline float get_ior(float nd, float vno, float lambda_nm){
+    // 如果是空氣 (nd=1.0) 或沒有給定阿貝數，則不產生色散
+    if(vno <= 1e-4f || nd <= 1.0f) return nd; 
+    
+    float dispersion_boost = 5.0f;
+
+    // 常數 523285.0 來自於可見光 F線(藍) 與 C線(紅) 的波長平方倒數差
+    float B = (nd - 1.0f) / vno * 523285.0f * dispersion_boost;
+    float A = nd - B / (587.56f * 587.56f); // 587.56nm 為 d線(黃光) 基準波長
+    
+    return A + B / (lambda_nm * lambda_nm);
+}
+
 // 在局部空間內穿透整個透鏡系統
-HOST_DEVICE inline bool trace_lens_system(const CudaLens &lens, float3 &ro, float3 &rd){
-    // [防 Crash 修正]：避免讀到未初始化記憶體導致無窮迴圈與越界
+HOST_DEVICE inline bool trace_lens_system(const CudaLens &lens, float3 &ro, float3 &rd, float lambda_nm){
     if(lens.num_elements <= 0 || lens.num_elements > MAX_LENS_ELEMENTS) return false;
 
     for(int i = 0; i < lens.num_elements; ++i){
@@ -651,11 +665,16 @@ HOST_DEVICE inline bool trace_lens_system(const CudaLens &lens, float3 &ro, floa
         float3 n;
 
         if(!intersect_spherical_lens(ro, rd, el.z_center, el.radius, el.aperture_radius, el.z_surf, t, n)){
-            return false; // 暗角遮擋 (這裡的 printf 必須移除，否則效能會極慢)
+            return false;
         }
 
         float3 p = ro + rd * t;
-        float eta = el.eta_in / el.eta_out;
+        
+        // [新增] 根據當前波長計算獨立的折射率 (這就是產生色散的核心)
+        float eta_in = get_ior(el.eta_in, el.vno_in, lambda_nm);
+        float eta_out = get_ior(el.eta_out, el.vno_out, lambda_nm);
+        float eta = eta_in / eta_out;
+        
         float3 refracted_dir = refract(rd, n, eta);
 
         if(length(refracted_dir) < 1e-4f) return false;
@@ -670,29 +689,26 @@ HOST_DEVICE inline bool trace_lens_system(const CudaLens &lens, float3 &ro, floa
 HOST_DEVICE inline bool generate_lens_ray(
     const CudaLens &lens, float pixel_x, float pixel_y, int W, int H,
     float3 cam_eye, float3 cam_w, float3 cam_u, float3 cam_v,
-    float3 &ro_world, float3 &rd_world, float u1, float u2){
-    // 1. 底片上的局部出發點 (單位: mm)
+    float3 &ro_world, float3 &rd_world, float u1, float u2, float lambda_nm){
+    
     float lx = (pixel_x / (float) W - 0.5f) * lens.film_width;
-    float ly = (0.5f - pixel_y / (float) H) * lens.film_height; // Y 軸翻轉
+    float ly = (0.5f - pixel_y / (float) H) * lens.film_height;
     float3 local_ro = make_float3(lx, ly, 0.0f);
 
-    // 2. 隨機瞄準最後方鏡片 (模擬出射瞳 Exit Pupil) 以獲取景深
     float rear_ap = lens.elements[0].aperture_radius;
     float rear_z = lens.elements[0].z_surf;
 
-    // [修改] 使用外部傳入的隨機數
     float r = sqrtf(u1) * rear_ap;
     float theta = 2.0f * PI * u2;
     float3 pupil_pos = make_float3(r * cosf(theta), r * sinf(theta), rear_z);
 
     float3 local_rd = normalize(pupil_pos - local_ro);
 
-    // 3. 模擬光線折射穿過整個透鏡系統
-    if(!trace_lens_system(lens, local_ro, local_rd)){
+    // [修改] 傳入 lambda_nm
+    if(!trace_lens_system(lens, local_ro, local_rd, lambda_nm)){
         return false;
     }
 
-    // 4. 將局部射線轉換回世界空間 (依照 Scale 縮放)
     ro_world = cam_eye + (cam_u * local_ro.x + cam_v * local_ro.y + cam_w * local_ro.z) * lens.scale;
     rd_world = normalize(cam_u * local_rd.x + cam_v * local_rd.y + cam_w * local_rd.z);
 

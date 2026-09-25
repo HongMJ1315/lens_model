@@ -70,3 +70,4 @@ add_custom_command(TARGET ${MY_EXECUTABLE} POST_BUILD
     "$<TARGET_FILE_DIR:${MY_EXECUTABLE}>/shader"
     VERBATIM
 )
+
