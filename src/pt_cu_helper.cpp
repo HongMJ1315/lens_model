@@ -67,12 +67,14 @@ void move_data_to_cuda_pt(std::map<int, AABB> groups, CudaLens lens, std::vector
 }
 
 // 將 lens 參數確實傳給 pt_render_wrapper
-void run_cuda_pt(CudaCamera cam, const CudaLens &lens, float3 *image_buffer, int light_depth, int eye_depth, int W, int H, int spp){
+void run_cuda_pt(CudaCamera cam, const CudaLens &lens, float3 *image_buffer, int light_depth, 
+    int eye_depth, int W, int H, int spp, bool enable_lens){
     pt_render_wrapper(
         pt_ns::cuda_lights.data(), pt_ns::cuda_lights.size(),
         pt_ns::cuda_spheres.data(), pt_ns::cuda_spheres.size(),
         pt_ns::cuda_triangles.data(), pt_ns::cuda_triangles.size(),
         pt_ns::scene_min_bound, pt_ns::scene_max_bound,
-        cam, lens, image_buffer, W, H, light_depth, pt_ns::light_sample, eye_depth, spp
+        cam, lens, image_buffer, W, H, light_depth, pt_ns::light_sample,
+         eye_depth, spp, enable_lens
     );
 }   

@@ -50,6 +50,7 @@ struct CudaHit{
     CudaMaterial_Old mtl_old;
     CudaMaterial mtl;
     bool is_light;
+    int light_idx;
 };
 
 struct CudaHitPoint{
@@ -443,6 +444,7 @@ HOST_DEVICE inline CudaHit find_closest_hit(
                 best.pos = ray_point + ray_dir * t;
                 best.normal = normalize(best.pos - lights[i].light_ball.center);
                 best.is_light = true;
+                best.light_idx = i; // <--- 【新增】明確記錄是哪一盞燈！
                 if(dot(best.normal, ray_dir) > 0.0f) best.normal = best.normal * -1.0f;
             }
         }
@@ -646,7 +648,7 @@ HOST_DEVICE inline float get_ior(float nd, float vno, float lambda_nm){
     // 如果是空氣 (nd=1.0) 或沒有給定阿貝數，則不產生色散
     if(vno <= 1e-4f || nd <= 1.0f) return nd; 
     
-    float dispersion_boost = 5.0f;
+    float dispersion_boost = 1.0f;
 
     // 常數 523285.0 來自於可見光 F線(藍) 與 C線(紅) 的波長平方倒數差
     float B = (nd - 1.0f) / vno * 523285.0f * dispersion_boost;

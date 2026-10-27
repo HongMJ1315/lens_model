@@ -37,7 +37,7 @@ void init_camera(Camera camera, float F,
     dy = (-2 * half_height * v) / float(H);
 }
 
-bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
+bool load_lens_from_csv(const std::string &filename, CudaLens &lens, float focus_dist_world = 2.0f) {
     std::ifstream file(filename);
     if (!file.is_open()) return false;
 
@@ -50,7 +50,7 @@ bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
         if (line.empty()) continue;
         std::stringstream ss(line);
         std::string val;
-        RawElement el = {0,0,1,0,0};
+        RawElement el = {0, 0, 1, 0, 0};
         if (std::getline(ss, val, ',')) el.radius = std::stof(val);
         if (std::getline(ss, val, ',')) el.thick = std::stof(val);
         if (std::getline(ss, val, ',')) el.nd = std::stof(val);
@@ -64,13 +64,51 @@ bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
     if (N == 0) return false;
 
     lens.num_elements = N;
-    lens.film_width = 36.0f; // 全片幅 36x24mm
+    lens.film_width = 36.0f;
     lens.film_height = 36.0f;
-    lens.scale = 0.002f;       // 若你的場景很大，可以調高這裡 (例如 0.1 表示 1mm = 0.1 單位)
-    lens.is_valid = 1; // 設為 1 代表啟用
+    lens.scale = 0.002f;
+    lens.is_valid = 1;
 
-    float focus_offset = 11.8f; 
-    float current_z = raw_el[N - 1].thick + focus_offset;
+    // =========================================================
+    // [自動光學計算] 近軸光線追蹤計算 EFL、BFL 與自動對焦距離
+    // =========================================================
+    float y = 1.0f, u = 0.0f, n_prev = 1.0f;
+    float lens_total_thick = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float n_next = (raw_el[i].nd > 1.0f) ? raw_el[i].nd : 1.0f;
+        float power = (raw_el[i].radius != 0.0f) ? (n_next - n_prev) / raw_el[i].radius : 0.0f;
+        u = (n_prev * u - y * power) / n_next;
+        if (i < N - 1) {
+            y += raw_el[i].thick * u;
+            lens_total_thick += raw_el[i].thick;
+        }
+        n_prev = n_next;
+    }
+    float efl = -1.0f / u;
+    float bfl_inf = -y / u; // 無限遠對焦時的後焦距 (BFL)
+
+    // 計算對焦在 focus_dist_world (預設 2.0 單位 = 1000mm) 時所需的實際後鏡片距離
+    float total_dist_mm = focus_dist_world / lens.scale;
+    float d_obj = std::max(efl * 1.2f, total_dist_mm - (lens_total_thick + bfl_inf));
+    float focused_rear_z = bfl_inf;
+
+    for (int iter = 0; iter < 5; ++iter) {
+        float y_f = 1.0f, u_f = y_f / d_obj, np = 1.0f;
+        for (int i = 0; i < N; ++i) {
+            float nn = (raw_el[i].nd > 1.0f) ? raw_el[i].nd : 1.0f;
+            float p = (raw_el[i].radius != 0.0f) ? (nn - np) / raw_el[i].radius : 0.0f;
+            u_f = (np * u_f - y_f * p) / nn;
+            if (i < N - 1) y_f += raw_el[i].thick * u_f;
+            np = nn;
+        }
+        focused_rear_z = -y_f / u_f;
+        d_obj = std::max(efl * 1.2f, total_dist_mm - (lens_total_thick + focused_rear_z));
+    }
+
+    std::cout << "[Lens Auto-Focus] EFL = " << efl << " mm, BFL(inf) = " << bfl_inf 
+              << " mm, Focused Rear Z = " << focused_rear_z << " mm\n";
+
+    float current_z = focused_rear_z;
 
     // 將資料由後向前 (Rear to Front) 反轉，建立給光追用的結構
     for (int i = 0; i < N; ++i) {
@@ -87,25 +125,16 @@ bool load_lens_from_csv(const std::string &filename, CudaLens &lens) {
         out.vno_in = raw_el[csv_idx].vno;
 
         if (csv_idx == 0) {
-            out.eta_out = 1.0f; 
-            out.vno_out = 0.0f; // 空氣無色散
-        }
-        else {
+            out.eta_out = 1.0f;
+            out.vno_out = 0.0f;
+        } else {
             out.eta_out = raw_el[csv_idx - 1].nd;
             out.vno_out = raw_el[csv_idx - 1].vno;
         }
 
-        // // 設定折射率 (光線從底片往場景射)
-        // out.eta_in = raw_el[csv_idx].nd;
-        // if (csv_idx == 0) out.eta_out = 1.0f; // 最前方鏡片接觸空氣
-        // else out.eta_out = raw_el[csv_idx - 1].nd;
-
         lens.elements[i] = out;
-        
-        // 疊加下一個面的 Z 位置
         if (csv_idx > 0) current_z += raw_el[csv_idx - 1].thick;
     }
-    lens.is_valid = true;
     return true;
 }
 
@@ -119,7 +148,8 @@ int main(int argc, char **argv){
     std::string output_file = "output.png";
     std::string input_file = "../../input.txt";
     std::string device = "gpu"; // [新增] 預設為 gpu，可選 cpu
-
+    std::string lens_model_file = "lens.csv"; // [新增] 預設鏡頭模型檔案
+    bool enable_lens = true; // [新增] 預設啟用物理鏡頭模型
     // 解析命令列參數
     for(int i = 1; i < argc; ++i){
         std::string arg = argv[i];
@@ -128,13 +158,16 @@ int main(int argc, char **argv){
         else if(arg == "--device" && i + 1 < argc) device = argv[++i]; // [新增]
         else if(arg == "--output" && i + 1 < argc) output_file = argv[++i];
         else if(arg == "--input" && i + 1 < argc) input_file = argv[++i];
+        else if(arg == "--enable-lens" && i + 1 < argc) enable_lens = std::stoi(argv[++i]) != 0; // [新增] 可透過命令列啟用/停用物理鏡頭模型
+        else if(arg == "--lens-model" && i + 1 < argc) lens_model_file = argv[++i]; // [新增] 可透過命令列指定鏡頭模型檔案
         else if(arg == "--help" || arg == "-h"){
             std::cout << "Usage: Hw1_CLI [options]\n"
                 << "Options:\n"
                 << "  --spp <int>       Samples per pixel (default: 8)\n"
                 << "  --device <string> Compute device: gpu, cpu (default: gpu)\n" // [新增]
                 << "  --output <string> Output image path\n"
-                << "  --input <string>  Input scene file\n";
+                << "  --input <string>  Input scene file\n"
+                << "  --lens-model <string> Lens model file (default: lens.csv)\n"; // [新增]
             return 0;
         }
     }
@@ -144,6 +177,7 @@ int main(int argc, char **argv){
     std::cout << " SPP    : " << spp << "\n";
     std::cout << " Input  : " << input_file << "\n";
     std::cout << " Output : " << output_file << "\n";
+    std::cout << " Lens   : " << (enable_lens ? "Enabled" : "Disabled") << "\n"; // [新增]
     std::cout << "====================================\n";
 
 
@@ -157,8 +191,8 @@ int main(int argc, char **argv){
 
     CudaLens h_lens = {};
     h_lens.is_valid = false;
-    if (load_lens_from_csv("lens.csv", h_lens)) {
-        std::cout << "[Init] Loaded physical lens from lens.csv successfully!" << std::endl;
+    if (enable_lens && load_lens_from_csv(lens_model_file, h_lens)) {
+        std::cout << "[Init] Loaded physical lens from " << lens_model_file << " successfully!" << std::endl;
     } else {
         std::cout << "[Init] No valid lens.csv found. Using default pinhole camera." << std::endl;
     }
@@ -282,7 +316,7 @@ int main(int argc, char **argv){
 
 
     // 呼叫你的 wrapper (如果在 helper 裡有加其他參數請自行補上)
-    run_cuda_pt(cam, h_lens, frame_results.data(), LIGHT_DEPTH, EYE_DEPTH, W, H, spp);
+    run_cuda_pt(cam, h_lens, frame_results.data(), LIGHT_DEPTH, EYE_DEPTH, W, H, spp, enable_lens);
     
     std::cout << "\n";
 
@@ -320,10 +354,11 @@ int main(int argc, char **argv){
     // [修正 4] 將寫檔與 return 移出迴圈外
     if(cv::imwrite(output_file, img_bgr)){
         std::cout << "[Success] Image saved!\n";
+        
     }
     else{
         std::cerr << "[Error] Failed to save image.\n";
     }
-
+    std::cout<<"Copyright (c) 2026, All rights reserved. MingChun Hung\n";
     return 0;
 }

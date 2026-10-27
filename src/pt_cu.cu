@@ -29,7 +29,7 @@ __global__ void cuda_path_trace_kernel(
     const CudaTriangle *d_triangles, int num_triangles,
     CudaCamera cam, const CudaLens *d_lens, curandState *states,
     int W, int H, int max_depth, float3 *d_image, int spp,
-    float3 *d_first_reflect_dir
+    float3 *d_first_reflect_dir,bool enable_lens
 ){
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= W * H) return;
@@ -65,7 +65,7 @@ __global__ void cuda_path_trace_kernel(
         float3 eyeray_point, eyeray_dir;
 
         // --- [修改區] 物理鏡頭光線生成 ---
-        if(d_lens->is_valid){
+        if(enable_lens && d_lens->is_valid){
             // 從 cam 的設定反推相機局部座標軸
             float3 cam_u = normalize(cam.dx);
             float3 cam_v = normalize(cam.dy * -1.0f); // 翻轉 dy 成為向上的 v
@@ -110,15 +110,17 @@ __global__ void cuda_path_trace_kernel(
 
             // --- 1. BSDF 光線打中光源 ---
             if(hit.is_light){
-                float3 emission = hit.mtl.base_color;
                 float area = 1.0f;
                 float cone_ratio = 1.0f;
                 bool valid_light = false;
+                int l_idx = -1;
 
+                // 尋找是打中哪一盞燈
                 for(int i = 0; i < num_lights; ++i){
                     float3 center_to_hit = hit.pos - d_lights[i].pos;
                     if(fabs(length(center_to_hit) - d_lights[i].light_ball.r) < 1e-2f){
                         valid_light = true;
+                        l_idx = i;
                         area = 4.0f * PI * d_lights[i].light_ball.r * d_lights[i].light_ball.r;
 
                         if(d_lights[i].cutoff > 0.0f && !d_lights[i].is_parallel){
@@ -130,37 +132,43 @@ __global__ void cuda_path_trace_kernel(
                             else if(dot(main_dir, normalize(center_to_hit)) < cosf(d_lights[i].cutoff)){
                                 cone_ratio = 0.0f;
                             }
-
                         }
                         break;
                     }
                 }
 
-                if(valid_light && cone_ratio > 0.0f){
-                    emission = emission / (area * cone_ratio);
-                }
-                else{
-                    emission = make_float3(0.0f, 0.0f, 0.0f);
-                }
-
-                if(emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f){
-                    if(last_is_delta){
-                        float3 contrib = throughput * emission;
-                        if(is_valid_color(contrib)){
-                            final_color = final_color + clamp_radiance(contrib, 15.0f);
-                        }
+                if(valid_light){
+                    float3 emission = hit.mtl.base_color;
+                    if(cone_ratio > 0.0f){
+                        emission = emission / (area * cone_ratio);
                     }
                     else{
-                        float pdf_light_dir = 0.0f;
+                        emission = make_float3(0.0f, 0.0f, 0.0f);
+                    }
 
-                        if(pdf_light_dir > 0.0f){
-                            float p_b = last_pdf_bsdf * last_pdf_bsdf;
-                            float p_l = pdf_light_dir * pdf_light_dir;
-                            float mis_w = p_b / fmaxf(p_b + p_l, 1e-8f);
-
-                            float3 contrib = throughput * emission * mis_w; // 使用放大後的 emission
+                    if(emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f){
+                        if(last_is_delta){
+                            float3 contrib = throughput * emission;
                             if(is_valid_color(contrib)){
                                 final_color = final_color + clamp_radiance(contrib, 15.0f);
+                            }
+                        }
+                        else{
+                            // [關鍵修復 1] 實作正確的 MIS 光源 PDF，解決粗糙高光死黑！
+                            float dist2 = dot(hit.pos - d_lights[l_idx].pos, hit.pos - d_lights[l_idx].pos);
+                            float cos_light = fmaxf(0.0f, dot(hit.normal, wo));
+                            float pdf_light_area = 1.0f / (num_lights * area);
+                            float pdf_light_dir = pdf_light_area * dist2 / fmaxf(cos_light, 1e-6f);
+
+                            if(pdf_light_dir > 0.0f){
+                                float p_b = last_pdf_bsdf * last_pdf_bsdf;
+                                float p_l = pdf_light_dir * pdf_light_dir;
+                                float mis_w = p_b / fmaxf(p_b + p_l, 1e-8f);
+
+                                float3 contrib = throughput * emission * mis_w; 
+                                if(is_valid_color(contrib)){
+                                    final_color = final_color + clamp_radiance(contrib, 15.0f);
+                                }
                             }
                         }
                     }
@@ -269,7 +277,10 @@ __global__ void cuda_path_trace_kernel(
             if(pdf_omega <= 0.0f && !is_delta) break;
 
             if(is_delta){
-                throughput = throughput * bsdf_val;
+                // [關鍵修復 2] 補回 Cosine 與 PDF 的除法，讓機率與能量完美守恆！
+                float cos_wi = fabs(dot(hit.normal, wi));
+                throughput = throughput * bsdf_val * cos_wi / pdf_omega;
+                
                 eyeray_dir = wi;
                 eyeray_refract = new_eta;
 
@@ -277,6 +288,7 @@ __global__ void cuda_path_trace_kernel(
                 else eyeray_point = hit.pos + hit.normal * EPSILON;
 
                 last_is_delta = true;
+                last_pdf_bsdf = pdf_omega;
 
                 if(!is_valid_color(throughput)) break;
 
@@ -321,7 +333,7 @@ void pt_render_wrapper(
     float3 scene_min, float3 scene_max,
     const CudaCamera cuda_camera, const CudaLens cuda_lens, float3 *h_image,
     int W, int H,
-    int light_depth, int light_sample, int eye_depth, int spp
+    int light_depth, int light_sample, int eye_depth, int spp, bool enable_lens
 ){
     CudaLight *d_lights;
     CudaSphere *d_spheres;
@@ -354,7 +366,7 @@ void pt_render_wrapper(
     cuda_path_trace_kernel << <blocks, BLOCK_SIZE >> > (
         d_lights, num_lights, d_spheres, num_spheres, d_triangles, num_triangles,
         cuda_camera, d_lens, d_states, W, H, eye_depth, d_image, spp,
-        d_first_reflect_dir
+        d_first_reflect_dir, enable_lens
         );
     cudaDeviceSynchronize();
 
